@@ -119,6 +119,11 @@
           <div><label class="block text-xs font-bold text-slate-700 uppercase mb-1">Verified By</label>
             <input type="text" id="reg-log-by" value="ADMIN (Regularized)" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" /></div>
         </div>
+        <div>
+          <label class="block text-xs font-bold text-slate-700 uppercase mb-1">Total Hrs (optional manual override)</label>
+          <input type="number" step="0.01" min="0" max="24" id="reg-log-total" placeholder="Leave empty to calculate from IN / OUT" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm" />
+          <p class="text-[10px] text-slate-500 mt-1">Overtime = Total Hrs minus the standard shift hours (8). It updates automatically.</p>
+        </div>
         <div class="pt-3 flex gap-2">
           <button type="submit" class="flex-1 py-2.5 rounded-xl bg-blue-900 hover:bg-blue-800 text-white font-bold text-xs shadow">Save Regularized Log</button>
           <button type="button" onclick="closeRegularizeModal()" class="py-2.5 px-4 rounded-xl bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold text-xs">Cancel</button>
@@ -445,6 +450,7 @@
             </div>
             <div class="flex flex-wrap gap-2">
               <button type="button" onclick="runAutoBlockEvaluation(true)" class="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold">🔍 Check 3-Day Auto-Block</button>
+              <button type="button" onclick="printAllWorkerQRs()" class="px-3 py-1.5 rounded-lg bg-purple-700 hover:bg-purple-600 text-white text-xs font-bold">🖨️ Print All QR Codes</button>
               <button type="button" onclick="downloadStaffTemplate()" class="px-3 py-1.5 rounded-lg bg-emerald-800 hover:bg-emerald-700 text-white text-xs font-bold">📋 Import Template</button>
               <button type="button" onclick="exportWorkersJSON()" class="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold">⬇ Backup Staff</button>
               <label class="px-3 py-1.5 rounded-lg bg-sky-100 hover:bg-sky-200 text-sky-900 text-xs font-bold cursor-pointer">⬆ Load Staff
@@ -454,7 +460,7 @@
           <div class="overflow-x-auto">
             <table class="w-full text-left border-collapse text-xs sm:text-sm">
               <thead><tr class="bg-slate-100 text-slate-700 border-b border-slate-200">
-                <th class="py-3 px-3 font-bold">Photo</th><th class="py-3 px-3 font-bold">ID NO</th><th class="py-3 px-3 font-bold">Full Name</th>
+                <th class="py-3 px-3 font-bold">Photo</th><th class="py-3 px-3 font-bold">Own QR Code</th><th class="py-3 px-3 font-bold">ID NO</th><th class="py-3 px-3 font-bold">Full Name</th>
                 <th class="py-3 px-3 font-bold">Designation</th><th class="py-3 px-3 font-bold">Contractor / Vendor</th>
                 <th class="py-3 px-3 font-bold">ID Status</th><th class="py-3 px-3 font-bold text-right">Actions</th></tr></thead>
               <tbody id="staff-directory-body" class="divide-y divide-slate-200"></tbody>
@@ -630,6 +636,18 @@ function calculateShiftMetrics(inT, outT){
   let d = b-a; if(d<0) d += 86400;
   const h = d/3600, ot = Math.max(0, h-(settings.shiftHours||8));
   return { totalHrs:h.toFixed(2)+" hrs", overtimeHrs:ot.toFixed(2)+" hrs", numericHours:h, numericOT:ot };
+}
+// Hours for one attendance record.
+// If the database already has Total Hrs (the admin may have edited it in the sheet), use that and
+// work out overtime from it. Otherwise calculate from IN / OUT time.
+function getMetrics(l){
+  if(!l || !l.outTime) return { totalHrs:"-", overtimeHrs:"-", numericHours:0, numericOT:0 };
+  const stored = parseFloat(String(l.totalHrs||'').replace(/[^0-9.]/g,''));
+  if(!isNaN(stored) && /\d/.test(String(l.totalHrs||''))){
+    const ot = Math.max(0, stored - (settings.shiftHours||8));
+    return { totalHrs:stored.toFixed(2)+" hrs", overtimeHrs:ot.toFixed(2)+" hrs", numericHours:stored, numericOT:ot };
+  }
+  return calculateShiftMetrics(l.inTime, l.outTime);
 }
 
 /* ---------- STORAGE ---------- */
@@ -820,8 +838,9 @@ function logout(){
 function switchTab(name){
   if(currentRole==='security' && name!=='scanner') return;
   ['scanner','register','logs','settings'].forEach(t => {
-    document.getElementById('tab-'+t).classList.toggle('hidden', t!==name);
-    const b = document.getElementById('btn-tab-'+t);
+    const panel = document.getElementById('tab-'+t), b = document.getElementById('btn-tab-'+t);
+    if(!panel || !b) return;   // Tab 4 (settings) is commented out in the HTML – skip it instead of crashing
+    panel.classList.toggle('hidden', t!==name);
     b.classList.remove('bg-blue-900','text-white','bg-slate-100','text-slate-700','hover:bg-slate-200');
     b.classList.add(...(t===name ? ['bg-blue-900','text-white'] : ['bg-slate-100','text-slate-700','hover:bg-slate-200']));
   });
@@ -1092,16 +1111,19 @@ async function submitRegularization(){
   const inTime = formatDisplayTime(document.getElementById('reg-log-in').value);
   const outTime = formatDisplayTime(document.getElementById('reg-log-out').value);
   const loggedBy = document.getElementById('reg-log-by').value.trim() || "ADMIN (Regularized)";
+  const manualTotal = parseFloat(document.getElementById('reg-log-total').value);
   if(!id || !date || !inTime){ showToast("Fill Worker ID, Date and IN Time."); return; }
 
   const w = workers.find(x => x.id.toUpperCase()===id) || { id, name:`Worker (${id})`, designation:'Site Operative', agency:'Contractor' };
-  const res = await sendOrQueue({ type:'REGULARIZE', id, date, inTime, outTime, loggedBy, name:w.name, designation:w.designation, agency:w.agency });
+  const res = await sendOrQueue({ type:'REGULARIZE', id, date, inTime, outTime, loggedBy, totalHrs: isNaN(manualTotal) ? '' : manualTotal, name:w.name, designation:w.designation, agency:w.agency });
   if(res.ok && res.record) upsertLog(res.record);
   else {
     const old = logs.find(l => l.id.toUpperCase()===id && normalizeDateISO(l.date)===date) || {};
-    const m = outTime ? calculateShiftMetrics(inTime, outTime) : { totalHrs:'-', overtimeHrs:'-' };
+    let m = outTime ? calculateShiftMetrics(inTime, outTime) : { totalHrs:'-', overtimeHrs:'-' };
+    if(outTime && !isNaN(manualTotal)) m = { totalHrs:manualTotal.toFixed(2)+' hrs', overtimeHrs:Math.max(0, manualTotal-(settings.shiftHours||8)).toFixed(2)+' hrs' };
     upsertLog({ ...old, date, id, name:w.name, designation:w.designation, agency:w.agency, inTime, outTime, totalHrs:m.totalHrs, overtimeHrs:m.overtimeHrs, loggedBy, pending:true });
   }
+  document.getElementById('reg-log-total').value = "";
   persistAll(); updateKPIs(); renderLogsTable(); closeRegularizeModal();
   showToast(`Attendance regularized for ${id} on ${formatDisplayDate(date)}.`);
 }
@@ -1255,13 +1277,18 @@ function updateKPIs(){
 }
 
 function renderDirectoryTable(){
-  document.getElementById('staff-directory-body').innerHTML = workers.map(w => {
+  document.getElementById('staff-directory-body').innerHTML = workers.map((w, wi) => {
     const active = w.status==='ACTIVE';
     const badge = active ? `<span class="px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-emerald-100 text-emerald-800 border border-emerald-300">ACTIVE</span>`
       : `<span class="px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-rose-100 text-rose-800 border border-rose-300">${esc(w.status)}</span><div class="text-[10px] text-rose-600 font-medium mt-0.5">${esc(w.blockReason)}</div>`;
     const idq = esc(w.id).replace(/'/g, "\\'");
     return `<tr class="hover:bg-slate-50 ${active?'':'bg-rose-50/40'}">
       <td class="py-2.5 px-3"><img src="${esc(workerPhoto(w))}" alt="" class="w-12 h-14 rounded object-cover border border-slate-300" onerror="this.onerror=null;this.src=placeholder('ID')" /></td>
+      <td class="py-2.5 px-3">
+        <div id="dir-qr-${wi}" class="inline-block p-1 bg-white border border-slate-300 rounded"></div>
+        <div class="text-[10px] font-bold text-slate-500 mt-0.5">OCEAN|${esc(w.id)}</div>
+        <button type="button" onclick="downloadWorkerQR(${wi})" class="mt-1 px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-white text-[10px] font-bold">⬇ PNG</button>
+      </td>
       <td class="py-2.5 px-3 font-extrabold text-sky-900">${esc(w.id)}</td>
       <td class="py-2.5 px-3 font-semibold">${esc(w.name)||'-'}</td>
       <td class="py-2.5 px-3 text-slate-700">${esc(w.designation)||'-'}</td>
@@ -1274,6 +1301,43 @@ function renderDirectoryTable(){
         <button type="button" onclick="deleteWorkerRegistration('${idq}')" class="px-2.5 py-1 rounded bg-rose-700 hover:bg-rose-600 text-white text-xs font-bold">Delete</button>
       </td></tr>`;
   }).join('');
+
+  // Draw ONE separate QR code for EVERY employee ID (content = "OCEAN|<ID>")
+  workers.forEach((w, wi) => {
+    const box = document.getElementById('dir-qr-' + wi);
+    if(box && window.QRCode) new QRCode(box, { text:`OCEAN|${w.id}`, width:80, height:80, colorDark:"#000000", colorLight:"#ffffff", correctLevel:QRCode.CorrectLevel.M });
+  });
+}
+
+// Get the QR picture of one worker as a PNG data URL
+function workerQrDataUrl(wi){
+  const box = document.getElementById('dir-qr-' + wi);
+  if(!box) return '';
+  const canvas = box.querySelector('canvas');
+  if(canvas) return canvas.toDataURL('image/png');
+  const img = box.querySelector('img');
+  return img ? img.src : '';
+}
+function downloadWorkerQR(wi){
+  const w = workers[wi], url = workerQrDataUrl(wi);
+  if(!w || !url){ showToast("QR is not ready yet."); return; }
+  const a = document.createElement('a'); a.href = url; a.download = `QR_${w.id}.png`; a.click();
+}
+// Print sheet: every employee's own QR with name + ID
+function printAllWorkerQRs(){
+  const list = workers.filter(w => w.status !== 'DELETED');
+  if(!list.length){ showToast("No workers registered."); return; }
+  const cells = workers.map((w, wi) => w.status==='DELETED' ? '' :
+    `<div class="c"><img src="${workerQrDataUrl(wi)}" /><b>${esc(w.id)}</b><span>${esc(w.name)}</span></div>`).join('');
+  const win = window.open('', '_blank');
+  if(!win){ showToast("Allow pop-ups to print the QR sheet."); return; }
+  win.document.write(`<html><head><title>Employee QR Codes</title><style>
+    body{font-family:Arial,sans-serif;margin:10mm} .g{display:grid;grid-template-columns:repeat(4,1fr);gap:8mm}
+    .c{border:1px solid #94a3b8;border-radius:6px;padding:6px;text-align:center;page-break-inside:avoid}
+    .c img{width:100%;max-width:120px} .c b{display:block;font-size:14px} .c span{font-size:11px;color:#334155}
+  </style></head><body><h3>OCEAN LIFESPACES – Employee QR Codes</h3><div class="g">${cells}</div>
+  <script>window.onload=function(){setTimeout(function(){window.print()},300)}<\/script></body></html>`);
+  win.document.close();
 }
 
 function sortedLogs(){
@@ -1297,7 +1361,7 @@ function renderLogsTable(){
     : `<span class="text-slate-400">—</span>`;
 
   tb.innerHTML = rows.map((l,i) => {
-    const m = l.outTime ? calculateShiftMetrics(l.inTime, l.outTime) : { totalHrs:'-', overtimeHrs:'-' };
+    const m = getMetrics(l);
     const w = workers.find(x => x.id.toUpperCase()===String(l.id).toUpperCase());
     return `<tr class="hover:bg-slate-50">
       <td class="py-2.5 px-3 font-bold text-slate-500">${i+1}</td>
@@ -1327,7 +1391,7 @@ function downloadDailyReportExcel(){
   if(!ids.size){ showToast("No data available."); return; }
   const rows = [...ids].map((id,i) => {
     const w = workers.find(x => x.id.toUpperCase()===id), l = day.find(x => x.id.toUpperCase()===id);
-    const m = l && l.outTime ? calculateShiftMetrics(l.inTime, l.outTime) : null;
+    const m = l && l.outTime ? getMetrics(l) : null;
     return { "S.No":i+1, "Date":formatDisplayDate(date), "ID NO":id, "Worker Name":(w&&w.name)||(l&&l.name)||"-",
       "Designation":(w&&w.designation)||(l&&l.designation)||"-", "Contractor":(w&&w.agency)||(l&&l.agency)||"-",
       "IN Time": l ? formatDisplayTime(l.inTime) : "-", "OUT Time": l && l.outTime ? formatDisplayTime(l.outTime) : "-",
@@ -1335,6 +1399,7 @@ function downloadDailyReportExcel(){
       "IN Photo": l ? (l.inPhoto||'') : "", "OUT Photo": l ? (l.outPhoto||'') : "", "Attendance Status": l && l.inTime ? "PRESENT" : "ABSENT" };
   });
   const ws = XLSX.utils.json_to_sheet(rows), wb = XLSX.utils.book_new();
+  ws['!cols'] = [7,13,12,24,20,28,11,11,12,12,30,30,18].map(wch => ({ wch }));   // wider columns
   XLSX.utils.book_append_sheet(wb, ws, "Daily_Attendance"); XLSX.writeFile(wb, `Ocean_Daily_Attendance_${date}.xlsx`);
   showToast(`Daily report downloaded (${rows.length} workers).`);
 }
@@ -1352,7 +1417,7 @@ function downloadMonthlyReportExcel(){
     for(let d=1; d<=days; d++){
       const key = `${month}-${pad(d)}`, l = logs.find(x => x.id.toUpperCase()===id && normalizeDateISO(x.date)===key);
       r[`${pad(d)}-${pad(mo)}`] = l ? "P" : "A";
-      if(l){ present++; if(l.outTime){ const m = calculateShiftMetrics(l.inTime, l.outTime); hrs += m.numericHours; ot += m.numericOT; } }
+      if(l){ present++; if(l.outTime){ const m = getMetrics(l); hrs += m.numericHours; ot += m.numericOT; } }
     }
     r["Total Present Days"] = present; r["Total Absent Days"] = days - present; r["Total Working Hrs"] = hrs.toFixed(2)+" hrs"; r["Total Overtime Hrs"] = ot.toFixed(2)+" hrs";
     return r;
@@ -1378,7 +1443,7 @@ async function exportLogsToExcel(){
   ws.views = [{ state:"frozen", ySplit:1 }];
 
   for(let i=0; i<data.length; i++){
-    const l = data[i], m = l.outTime ? calculateShiftMetrics(l.inTime, l.outTime) : { totalHrs:"-", overtimeHrs:"-" };
+    const l = data[i], m = getMetrics(l);
     const row = ws.addRow([i+1, formatDisplayDate(l.date), l.id, l.name, l.designation, l.agency, formatDisplayTime(l.inTime), l.outTime ? formatDisplayTime(l.outTime) : "On-Site", m.totalHrs, m.overtimeHrs, "", "", l.loggedBy||""]);
     row.height = 30; row.alignment = { vertical:"middle" };
     [[l.inPhoto, 11], [l.outPhoto, 12]].forEach(([src, col]) => {
